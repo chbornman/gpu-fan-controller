@@ -1,8 +1,8 @@
 # GPU Fan Controller Configuration
 # Copy to /etc/gpu_fan_ctrl/config.yaml
 
-# Serial port for ESP32 (ESP32-S3 typically shows as ttyACM0)
-serial_port: "/dev/ttyACM0"
+# Serial port for ESP32 (use symlink from udev rule for stability)
+serial_port: "/dev/gpu-fan-ctrl"
 serial_baud: 115200
 
 # How often to check temperature and send commands (seconds)

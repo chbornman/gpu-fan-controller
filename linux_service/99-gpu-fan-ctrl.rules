@@ -1,0 +1,8 @@
+# udev rule for ESP32-S3 GPU Fan Controller
+# Creates stable symlink at /dev/gpu-fan-ctrl
+#
+# Install: sudo cp 99-gpu-fan-ctrl.rules /etc/udev/rules.d/
+# Reload:  sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# ESP32-S3 USB JTAG/serial debug unit
+SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="1001", SYMLINK+="gpu-fan-ctrl", MODE="0666"

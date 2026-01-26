@@ -36,6 +36,13 @@ else
     echo "Config already exists at /etc/gpu_fan_ctrl/config.yaml (not overwritten)"
 fi
 
+# Install udev rule for stable device symlink
+echo "Installing udev rule..."
+cp "$SCRIPT_DIR/99-gpu-fan-ctrl.rules" /etc/udev/rules.d/
+udevadm control --reload-rules
+udevadm trigger
+echo "Created symlink: /dev/gpu-fan-ctrl -> ESP32"
+
 # Install systemd service
 echo "Installing systemd service..."
 cp "$SCRIPT_DIR/gpu-fan-ctrl.service" /etc/systemd/system/
@@ -45,11 +52,10 @@ echo ""
 echo "=== Installation Complete ==="
 echo ""
 echo "Next steps:"
-echo "  1. Edit config:    sudo nano /etc/gpu_fan_ctrl/config.yaml"
-echo "  2. Check serial:   ls -la /dev/ttyACM*"
-echo "  3. Test manually:  sudo python3 /opt/gpu_fan_ctrl/gpu_fan_ctrl.py -v"
-echo "  4. Enable service: sudo systemctl enable gpu-fan-ctrl"
-echo "  5. Start service:  sudo systemctl start gpu-fan-ctrl"
-echo "  6. Check status:   sudo systemctl status gpu-fan-ctrl"
-echo "  7. View logs:      journalctl -u gpu-fan-ctrl -f"
+echo "  1. Verify symlink: ls -la /dev/gpu-fan-ctrl"
+echo "  2. Test manually:  sudo python3 /opt/gpu_fan_ctrl/gpu_fan_ctrl.py -v"
+echo "  3. Enable service: sudo systemctl enable gpu-fan-ctrl"
+echo "  4. Start service:  sudo systemctl start gpu-fan-ctrl"
+echo "  5. Check status:   sudo systemctl status gpu-fan-ctrl"
+echo "  6. View logs:      journalctl -u gpu-fan-ctrl -f"
 echo ""
