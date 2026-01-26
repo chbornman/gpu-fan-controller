@@ -1,0 +1,27 @@
+[Unit]
+Description=GPU Fan Controller Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/gpu_fan_ctrl/gpu_fan_ctrl.py --config /etc/gpu_fan_ctrl/config.yaml
+Restart=always
+RestartSec=5
+
+# Run as root to access /sys and serial port
+# Or create a dedicated user with appropriate permissions
+User=root
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gpu-fan-ctrl
+
+# Security hardening (optional, comment out if causing issues)
+ProtectSystem=strict
+ReadWritePaths=/dev
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

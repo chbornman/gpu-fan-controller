@@ -1,0 +1,26 @@
+# ESP-IDF build artifacts
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+.uv/
+
+# IDE
+.vscode/
+.idea/
+.cache/
+
+# OS
+.DS_Store
+
+# Unrelated test files
+cli_plan.py
+sonnet_gen_plan.py
+tic_tac_toe.c

@@ -1,0 +1,26 @@
+# GPU Fan Controller Configuration
+# Copy to /etc/gpu_fan_ctrl/config.yaml
+
+# Serial port for ESP32 (ESP32-S3 typically shows as ttyACM0)
+serial_port: "/dev/ttyACM0"
+serial_baud: 115200
+
+# How often to check temperature and send commands (seconds)
+# Must be less than ESP32 watchdog timeout (5 seconds)
+poll_interval: 2.0
+
+# Fan curve: [temperature_celsius, fan_speed_percent]
+# Linear interpolation between points
+# Step function at 35C, then ramp to 100% at 75C
+fan_curve:
+  - [35, 0]      # 35C and below -> 0% (fan off)
+  - [35.1, 25]   # Just above 35C -> step to 25%
+  - [75, 100]    # 75C -> 100% (full blast)
+
+# Don't change fan speed unless temp changed by this much
+# Prevents fan speed oscillation
+hysteresis_c: 2.0
+
+# Minimum speed change to actually send command
+# Reduces serial communication
+min_speed_change: 3

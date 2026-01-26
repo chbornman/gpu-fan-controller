@@ -1,0 +1,12 @@
+[project]
+name = "gpu-fan-ctrl"
+version = "0.1.0"
+description = "GPU Fan Controller - Linux service for ESP32-based fan control"
+requires-python = ">=3.11"
+dependencies = [
+    "pyserial>=3.5",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+gpu-fan-ctrl = "gpu_fan_ctrl:main"
