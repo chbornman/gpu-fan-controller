@@ -54,6 +54,11 @@ class Config:
     # Minimum speed change to actually send (reduces serial chatter)
     min_speed_change: int = 3
 
+    # Smoothing: max speed change per poll interval (0 = disabled)
+    # Ramp up faster (cooling needed), ramp down slower (avoid oscillation)
+    ramp_up_rate: int = 20    # Max % increase per poll
+    ramp_down_rate: int = 10  # Max % decrease per poll
+
     def __post_init__(self):
         if self.fan_curve is None:
             # Default fan curve for V620 / LLM workloads
@@ -281,11 +286,33 @@ class FanController:
 
         return rpm, pulses
 
+    def smooth_speed(self, current: int, target: int) -> int:
+        """
+        Calculate next speed step toward target with smoothing.
+        Ramps up faster than down to prioritize cooling.
+        Returns the next speed to set.
+        """
+        if current == target:
+            return target
+
+        if target > current:
+            # Ramping up - use faster rate
+            step = min(self.config.ramp_up_rate, target - current)
+            return current + step
+        else:
+            # Ramping down - use slower rate
+            step = min(self.config.ramp_down_rate, current - target)
+            return current - step
+
     def run(self, sensor_path: str):
         """Main control loop."""
         log.info("Starting fan control loop")
         log.info(f"Poll interval: {self.config.poll_interval}s")
         log.info(f"Fan curve: {self.config.fan_curve}")
+        log.info(f"Smoothing: ramp_up={self.config.ramp_up_rate}%/poll, ramp_down={self.config.ramp_down_rate}%/poll")
+
+        target_speed = None  # What the fan curve says we should be at
+        current_speed = self.last_speed or 0  # What we've actually set
 
         while self.running:
             try:
@@ -294,43 +321,48 @@ class FanController:
                 if temp is None:
                     log.warning("Failed to read GPU temp, using max speed")
                     self.set_speed(100)
+                    current_speed = 100
+                    target_speed = 100
                     time.sleep(self.config.poll_interval)
                     continue
 
-                # Apply hysteresis
-                if self.last_temp is not None:
-                    if abs(temp - self.last_temp) < self.config.hysteresis_c:
-                        # Temp hasn't changed enough, just ping to reset watchdog
-                        self.ping()
-                        time.sleep(self.config.poll_interval)
-                        continue
+                # Calculate target speed from fan curve
+                new_target = calculate_fan_speed(temp, self.config.fan_curve)
 
-                # Calculate target speed
-                target_speed = calculate_fan_speed(temp, self.config.fan_curve)
-
-                # Check if speed change is significant
-                if self.last_speed is not None:
-                    if abs(target_speed - self.last_speed) < self.config.min_speed_change:
-                        # Not enough change, just ping and log RPM
-                        self.ping()
-                        rpm, pulses = self.get_rpm()
-                        log.debug(f"Temp: {temp:.1f}C | Fan: {self.last_speed}% | RPM: {rpm} | Pulses: {pulses}")
-                        time.sleep(self.config.poll_interval)
-                        continue
-
-                # Set new speed
-                if self.set_speed(target_speed):
-                    rpm, pulses = self.get_rpm()
-                    log.info(f"GPU: {temp:.1f}C -> Fan: {target_speed}% (was {self.last_speed}%) | RPM: {rpm} | Pulses: {pulses}")
+                # Update target if temp changed enough (hysteresis)
+                if self.last_temp is None or abs(temp - self.last_temp) >= self.config.hysteresis_c:
+                    target_speed = new_target
                     self.last_temp = temp
-                    self.last_speed = target_speed
+
+                # If no target yet, initialize it
+                if target_speed is None:
+                    target_speed = new_target
+
+                # Calculate next step toward target (smoothing)
+                next_speed = self.smooth_speed(current_speed, target_speed)
+
+                # Check if we need to send a command
+                if next_speed != current_speed:
+                    if self.set_speed(next_speed):
+                        rpm, pulses = self.get_rpm()
+                        if next_speed == target_speed:
+                            log.info(f"GPU: {temp:.1f}C -> Fan: {next_speed}% (target reached) | RPM: {rpm}")
+                        else:
+                            log.info(f"GPU: {temp:.1f}C -> Fan: {next_speed}% (ramping to {target_speed}%) | RPM: {rpm}")
+                        current_speed = next_speed
+                        self.last_speed = current_speed
+                    else:
+                        # Failed to set speed, try to reconnect
+                        log.warning("Lost connection, attempting reconnect...")
+                        self.disconnect()
+                        time.sleep(1)
+                        if not self.connect():
+                            log.error("Reconnect failed, will retry...")
                 else:
-                    # Failed to set speed, try to reconnect
-                    log.warning("Lost connection, attempting reconnect...")
-                    self.disconnect()
-                    time.sleep(1)
-                    if not self.connect():
-                        log.error("Reconnect failed, will retry...")
+                    # At target, just ping to reset watchdog
+                    self.ping()
+                    rpm, pulses = self.get_rpm()
+                    log.debug(f"Temp: {temp:.1f}C | Fan: {current_speed}% | RPM: {rpm}")
 
                 time.sleep(self.config.poll_interval)
 

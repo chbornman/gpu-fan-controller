@@ -24,3 +24,9 @@ hysteresis_c: 2.0
 # Minimum speed change to actually send command
 # Reduces serial communication
 min_speed_change: 3
+
+# Smoothing: max speed change per poll interval
+# Ramps up faster (cooling priority), down slower (reduce noise/oscillation)
+# Set to 100 to disable smoothing (instant changes)
+ramp_up_rate: 20    # Max % increase per poll (0-100% in ~10s at 2s poll)
+ramp_down_rate: 10  # Max % decrease per poll (100-0% in ~20s at 2s poll)
