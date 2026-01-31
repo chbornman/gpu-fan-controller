@@ -14,8 +14,8 @@
 static const char *TAG = "gpu_fan";
 
 // GPIO Configuration - adjust these for your wiring
-#define GPIO_FAN_PWM    5   // Blue wire - PWM control
-#define GPIO_FAN_TACH   4   // Green wire - Tachometer input
+#define GPIO_FAN_PWM    4   // Blue wire - PWM control
+#define GPIO_FAN_TACH   5   // Green wire - Tachometer input
 
 // Watchdog: if no command received in this time, ramp to 100%
 #define WATCHDOG_TIMEOUT_MS 5000

@@ -13,14 +13,16 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# Install Python dependencies
-echo "Installing Python dependencies..."
-pip3 install pyserial pyyaml
-
 # Create directories
 echo "Creating directories..."
 mkdir -p /opt/gpu_fan_ctrl
 mkdir -p /etc/gpu_fan_ctrl
+
+# Create virtual environment and install dependencies
+echo "Setting up Python virtual environment..."
+python3 -m venv /opt/gpu_fan_ctrl/venv
+/opt/gpu_fan_ctrl/venv/bin/pip install --upgrade pip
+/opt/gpu_fan_ctrl/venv/bin/pip install pyserial pyyaml
 
 # Copy files
 echo "Copying files..."
@@ -53,7 +55,7 @@ echo "=== Installation Complete ==="
 echo ""
 echo "Next steps:"
 echo "  1. Verify symlink: ls -la /dev/gpu-fan-ctrl"
-echo "  2. Test manually:  sudo python3 /opt/gpu_fan_ctrl/gpu_fan_ctrl.py -v"
+echo "  2. Test manually:  sudo /opt/gpu_fan_ctrl/venv/bin/python /opt/gpu_fan_ctrl/gpu_fan_ctrl.py -v"
 echo "  3. Enable service: sudo systemctl enable gpu-fan-ctrl"
 echo "  4. Start service:  sudo systemctl start gpu-fan-ctrl"
 echo "  5. Check status:   sudo systemctl status gpu-fan-ctrl"

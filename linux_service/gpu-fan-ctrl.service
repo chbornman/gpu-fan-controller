@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /opt/gpu_fan_ctrl/gpu_fan_ctrl.py --config /etc/gpu_fan_ctrl/config.yaml
+ExecStart=/opt/gpu_fan_ctrl/venv/bin/python /opt/gpu_fan_ctrl/gpu_fan_ctrl.py --config /etc/gpu_fan_ctrl/config.yaml
 Restart=always
 RestartSec=5
 

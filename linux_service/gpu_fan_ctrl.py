@@ -31,8 +31,8 @@ import yaml
 # Logging setup
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
@@ -40,6 +40,7 @@ log = logging.getLogger(__name__)
 @dataclass
 class Config:
     """Service configuration"""
+
     serial_port: str = "/dev/ttyACM0"
     serial_baud: int = 115200
     poll_interval: float = 2.0  # seconds - must be < watchdog timeout (5s)
@@ -56,7 +57,7 @@ class Config:
 
     # Smoothing: max speed change per poll interval (0 = disabled)
     # Ramp up faster (cooling needed), ramp down slower (avoid oscillation)
-    ramp_up_rate: int = 20    # Max % increase per poll
+    ramp_up_rate: int = 20  # Max % increase per poll
     ramp_down_rate: int = 10  # Max % decrease per poll
 
     def __post_init__(self):
@@ -64,9 +65,9 @@ class Config:
             # Default fan curve for V620 / LLM workloads
             # Step function at 35C, then ramp to 100% at 75C
             self.fan_curve = [
-                (35, 0),      # 35C and below -> 0% (fan off)
-                (35.1, 25),   # Just above 35C -> step to 25%
-                (75, 100),    # 75C -> 100% (full blast)
+                (35, 0),  # 35C and below -> 0% (fan off)
+                (35.1, 25),  # Just above 35C -> step to 25%
+                (75, 100),  # 75C -> 100% (full blast)
             ]
 
 
@@ -88,7 +89,9 @@ def find_gpu_temp_sensor() -> str | None:
             continue
 
         for temp_input in hwmon_dir.glob("temp*_input"):
-            label_file = temp_input.with_name(temp_input.name.replace("_input", "_label"))
+            label_file = temp_input.with_name(
+                temp_input.name.replace("_input", "_label")
+            )
             label = ""
             if label_file.exists():
                 label = label_file.read_text().strip().lower()
@@ -106,7 +109,9 @@ def find_gpu_temp_sensor() -> str | None:
     # Prefer junction > edge > anything else
     for preferred in ["junction", "edge", ""]:
         for path, label in all_sensors:
-            if label == preferred or (preferred == "" and label not in ["junction", "edge"]):
+            if label == preferred or (
+                preferred == "" and label not in ["junction", "edge"]
+            ):
                 log.info(f"Using AMD GPU sensor: {path} (label: {label or 'unknown'})")
                 return path
 
@@ -119,7 +124,7 @@ def find_gpu_temp_sensor() -> str | None:
 def read_gpu_temp(sensor_path: str) -> float | None:
     """Read GPU temperature in Celsius from sysfs."""
     try:
-        with open(sensor_path, 'r') as f:
+        with open(sensor_path, "r") as f:
             # sysfs reports millidegrees
             millidegrees = int(f.read().strip())
             return millidegrees / 1000.0
@@ -137,7 +142,9 @@ def calculate_fan_speed(temp_c: float, fan_curve: list) -> int:
         return fan_curve[0][1]
 
     if temp_c >= fan_curve[-1][0]:
-        log.debug(f"Temp {temp_c:.1f}C >= max {fan_curve[-1][0]}C -> {fan_curve[-1][1]}%")
+        log.debug(
+            f"Temp {temp_c:.1f}C >= max {fan_curve[-1][0]}C -> {fan_curve[-1][1]}%"
+        )
         return fan_curve[-1][1]
 
     # Find the two points to interpolate between
@@ -150,7 +157,9 @@ def calculate_fan_speed(temp_c: float, fan_curve: list) -> int:
             ratio = (temp_c - t1) / (t2 - t1)
             speed = s1 + ratio * (s2 - s1)
             result = int(round(speed))
-            log.debug(f"Temp {temp_c:.1f}C in [{t1}C,{t2}C] -> lerp({s1}%,{s2}%) = {result}%")
+            log.debug(
+                f"Temp {temp_c:.1f}C in [{t1}C,{t2}C] -> lerp({s1}%,{s2}%) = {result}%"
+            )
             return result
 
     return fan_curve[-1][1]  # Fallback to max
@@ -172,7 +181,7 @@ class FanController:
             self.serial = serial.Serial(
                 port=self.config.serial_port,
                 baudrate=self.config.serial_baud,
-                timeout=1.0
+                timeout=1.0,
             )
             # Wait for ESP32 to be ready
             time.sleep(0.5)
@@ -216,7 +225,11 @@ class FanController:
                     if line:
                         response_lines.append(line)
                         # Check if we got a complete response
-                        if line.startswith("OK:") or line.startswith("ERR:") or line.startswith("PONG"):
+                        if (
+                            line.startswith("OK:")
+                            or line.startswith("ERR:")
+                            or line.startswith("PONG")
+                        ):
                             break
                 else:
                     time.sleep(0.01)
@@ -281,7 +294,9 @@ class FanController:
 
         # Sanity check - PC fans max out around 10k RPM
         if rpm is not None and rpm > 50000:
-            log.warning(f"RPM reading {rpm} is bogus (pulses: {pulses}) - shared ground connected?")
+            log.warning(
+                f"RPM reading {rpm} is bogus (pulses: {pulses}) - shared ground connected?"
+            )
             return None, pulses
 
         return rpm, pulses
@@ -309,10 +324,27 @@ class FanController:
         log.info("Starting fan control loop")
         log.info(f"Poll interval: {self.config.poll_interval}s")
         log.info(f"Fan curve: {self.config.fan_curve}")
-        log.info(f"Smoothing: ramp_up={self.config.ramp_up_rate}%/poll, ramp_down={self.config.ramp_down_rate}%/poll")
+        log.info(
+            f"Smoothing: ramp_up={self.config.ramp_up_rate}%/poll, ramp_down={self.config.ramp_down_rate}%/poll"
+        )
 
         target_speed = None  # What the fan curve says we should be at
-        current_speed = self.last_speed or 0  # What we've actually set
+        current_speed = self.last_speed  # What we've actually set (None = unknown)
+
+        # Initial read and write on startup
+        temp = read_gpu_temp(sensor_path)
+        if temp is not None:
+            target_speed = calculate_fan_speed(temp, self.config.fan_curve)
+            current_speed = target_speed
+            self.set_speed(current_speed)
+            self.last_temp = temp
+            self.last_speed = current_speed
+            log.info(f"Initial: GPU {temp:.1f}C -> Fan {current_speed}%")
+        else:
+            log.warning("Failed to read initial GPU temp, starting at 100%")
+            current_speed = 100
+            target_speed = 100
+            self.set_speed(100)
 
         while self.running:
             try:
@@ -330,7 +362,10 @@ class FanController:
                 new_target = calculate_fan_speed(temp, self.config.fan_curve)
 
                 # Update target if temp changed enough (hysteresis)
-                if self.last_temp is None or abs(temp - self.last_temp) >= self.config.hysteresis_c:
+                if (
+                    self.last_temp is None
+                    or abs(temp - self.last_temp) >= self.config.hysteresis_c
+                ):
                     target_speed = new_target
                     self.last_temp = temp
 
@@ -346,9 +381,13 @@ class FanController:
                     if self.set_speed(next_speed):
                         rpm, pulses = self.get_rpm()
                         if next_speed == target_speed:
-                            log.info(f"GPU: {temp:.1f}C -> Fan: {next_speed}% (target reached) | RPM: {rpm}")
+                            log.info(
+                                f"GPU: {temp:.1f}C -> Fan: {next_speed}% (target reached) | RPM: {rpm}"
+                            )
                         else:
-                            log.info(f"GPU: {temp:.1f}C -> Fan: {next_speed}% (ramping to {target_speed}%) | RPM: {rpm}")
+                            log.info(
+                                f"GPU: {temp:.1f}C -> Fan: {next_speed}% (ramping to {target_speed}%) | RPM: {rpm}"
+                            )
                         current_speed = next_speed
                         self.last_speed = current_speed
                     else:
@@ -385,7 +424,7 @@ def load_config(config_path: str | None) -> Config:
 
     if config_path and os.path.exists(config_path):
         try:
-            with open(config_path, 'r') as f:
+            with open(config_path, "r") as f:
                 data = yaml.safe_load(f)
                 if data:
                     for key, value in data.items():
@@ -403,7 +442,9 @@ def main():
     parser.add_argument("--config", "-c", help="Path to config YAML file")
     parser.add_argument("--port", "-p", help="Serial port (overrides config)")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
-    parser.add_argument("--dry-run", action="store_true", help="Don't send commands, just log")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Don't send commands, just log"
+    )
     args = parser.parse_args()
 
     if args.verbose:
