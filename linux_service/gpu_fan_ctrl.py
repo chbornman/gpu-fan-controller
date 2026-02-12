@@ -22,7 +22,7 @@ import os
 import signal
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import serial
@@ -47,7 +47,15 @@ class Config:
 
     # Fan curve: list of (temp_c, speed_percent) tuples
     # Linear interpolation between points
-    fan_curve: list = None
+    # Default fan curve for V620 / LLM workloads
+    # Step function at 35C, then ramp to 100% at 75C
+    fan_curve: list = field(
+        default_factory=lambda: [
+            (35, 0),  # 35C and below -> 0% (fan off)
+            (35.1, 25),  # Just above 35C -> step to 25%
+            (75, 100),  # 75C -> 100% (full blast)
+        ]
+    )
 
     # Hysteresis: don't change speed unless temp changed by this much
     hysteresis_c: float = 2.0
@@ -59,16 +67,6 @@ class Config:
     # Ramp up faster (cooling needed), ramp down slower (avoid oscillation)
     ramp_up_rate: int = 20  # Max % increase per poll
     ramp_down_rate: int = 10  # Max % decrease per poll
-
-    def __post_init__(self):
-        if self.fan_curve is None:
-            # Default fan curve for V620 / LLM workloads
-            # Step function at 35C, then ramp to 100% at 75C
-            self.fan_curve = [
-                (35, 0),  # 35C and below -> 0% (fan off)
-                (35.1, 25),  # Just above 35C -> step to 25%
-                (75, 100),  # 75C -> 100% (full blast)
-            ]
 
 
 def find_gpu_temp_sensor() -> str | None:
@@ -168,12 +166,19 @@ def calculate_fan_speed(temp_c: float, fan_curve: list) -> int:
 class FanController:
     """Manages serial communication with ESP32 fan controller."""
 
+    # Reconnection settings
+    RECONNECT_DELAY_INITIAL = 1.0  # seconds
+    RECONNECT_DELAY_MAX = 30.0  # seconds
+    RECONNECT_DELAY_MULTIPLIER = 2.0
+
     def __init__(self, config: Config):
         self.config = config
         self.serial: serial.Serial | None = None
         self.last_temp = None
         self.last_speed = None
         self.running = True
+        self._connected = False
+        self._reconnect_delay = self.RECONNECT_DELAY_INITIAL
 
     def connect(self) -> bool:
         """Connect to ESP32 over serial."""
@@ -189,27 +194,69 @@ class FanController:
             # Flush any startup messages
             self.serial.reset_input_buffer()
 
-            # Test connection
-            if self.ping():
+            # Test connection with direct write/read (not ping, to avoid recursion)
+            self.serial.write(b"PING\n")
+            self.serial.flush()
+            time.sleep(0.1)
+            response = self.serial.read(self.serial.in_waiting or 1).decode(
+                errors="ignore"
+            )
+
+            if "PONG" in response:
                 log.info(f"Connected to ESP32 on {self.config.serial_port}")
+                self._connected = True
+                self._reconnect_delay = self.RECONNECT_DELAY_INITIAL
                 return True
             else:
                 log.error("ESP32 not responding to PING")
+                self._connected = False
                 return False
 
-        except serial.SerialException as e:
+        except (serial.SerialException, OSError) as e:
             log.error(f"Failed to connect to {self.config.serial_port}: {e}")
+            self._connected = False
             return False
 
     def disconnect(self):
         """Close serial connection."""
-        if self.serial and self.serial.is_open:
-            self.serial.close()
+        self._connected = False
+        if self.serial:
+            try:
+                if self.serial.is_open:
+                    self.serial.close()
+            except (serial.SerialException, OSError):
+                pass  # Already broken, ignore
+            self.serial = None
             log.info("Disconnected from ESP32")
 
+    def reconnect(self) -> bool:
+        """
+        Attempt to reconnect with exponential backoff.
+        Returns True if reconnection succeeded.
+        """
+        self.disconnect()
+
+        log.warning(f"Attempting reconnect in {self._reconnect_delay:.1f}s...")
+        time.sleep(self._reconnect_delay)
+
+        if self.connect():
+            log.info("Reconnected successfully")
+            return True
+        else:
+            # Increase delay for next attempt (exponential backoff)
+            self._reconnect_delay = min(
+                self._reconnect_delay * self.RECONNECT_DELAY_MULTIPLIER,
+                self.RECONNECT_DELAY_MAX,
+            )
+            log.error(f"Reconnect failed, next attempt in {self._reconnect_delay:.1f}s")
+            return False
+
     def send_command(self, cmd: str) -> str | None:
-        """Send command and return response."""
-        if not self.serial or not self.serial.is_open:
+        """
+        Send command and return response.
+        Returns None and marks disconnected on I/O errors.
+        """
+        if not self._connected or not self.serial or not self.serial.is_open:
             return None
 
         try:
@@ -237,12 +284,15 @@ class FanController:
             response = "\n".join(response_lines)
             return response
 
-        except serial.SerialException as e:
+        except (serial.SerialException, OSError) as e:
             log.error(f"Serial error: {e}")
+            self._connected = False
             return None
 
     def ping(self) -> bool:
         """Check if ESP32 is responding."""
+        if not self._connected:
+            return False
         response = self.send_command("PING")
         ok = response is not None and "PONG" in response
         if ok:
@@ -348,6 +398,16 @@ class FanController:
 
         while self.running:
             try:
+                # Check if we need to reconnect
+                if not self._connected:
+                    if not self.reconnect():
+                        # Reconnect failed, wait and retry next loop
+                        continue
+                    # After reconnect, re-send current speed to sync ESP32 state
+                    if current_speed is not None:
+                        log.info(f"Re-sending speed {current_speed}% after reconnect")
+                        self.set_speed(current_speed)
+
                 # Read GPU temperature
                 temp = read_gpu_temp(sensor_path)
                 if temp is None:
@@ -390,13 +450,8 @@ class FanController:
                             )
                         current_speed = next_speed
                         self.last_speed = current_speed
-                    else:
-                        # Failed to set speed, try to reconnect
-                        log.warning("Lost connection, attempting reconnect...")
-                        self.disconnect()
-                        time.sleep(1)
-                        if not self.connect():
-                            log.error("Reconnect failed, will retry...")
+                    # If set_speed failed, _connected is now False,
+                    # reconnect will happen at start of next loop
                 else:
                     # At target, just ping to reset watchdog
                     self.ping()

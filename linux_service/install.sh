@@ -20,7 +20,7 @@ mkdir -p /etc/gpu_fan_ctrl
 
 # Create virtual environment and install dependencies
 echo "Setting up Python virtual environment..."
-python3 -m venv /opt/gpu_fan_ctrl/venv
+python3 -m venv --copies /opt/gpu_fan_ctrl/venv
 /opt/gpu_fan_ctrl/venv/bin/pip install --upgrade pip
 /opt/gpu_fan_ctrl/venv/bin/pip install pyserial pyyaml
 
