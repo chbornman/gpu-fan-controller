@@ -453,8 +453,11 @@ class FanController:
                     # If set_speed failed, _connected is now False,
                     # reconnect will happen at start of next loop
                 else:
-                    # At target, just ping to reset watchdog
-                    self.ping()
+                    # At target, ping to reset ESP32 watchdog
+                    if not self.ping():
+                        log.warning("Ping failed, marking disconnected for reconnect")
+                        self._connected = False
+                        continue
                     rpm, pulses = self.get_rpm()
                     log.debug(f"Temp: {temp:.1f}C | Fan: {current_speed}% | RPM: {rpm}")
 

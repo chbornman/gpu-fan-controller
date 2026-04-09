@@ -7,3 +7,6 @@
 # Matches THIS specific ESP32 board by serial number
 # Find yours with: udevadm info -a -n /dev/ttyACM* | grep serial
 SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{serial}=="5577018485", SYMLINK+="gpu-fan-ctrl", MODE="0666"
+
+# Disable USB autosuspend for this device to prevent watchdog timeouts
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="1a86", ATTR{serial}=="5577018485", ATTR{power/autosuspend_delay_ms}="-1"
