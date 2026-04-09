@@ -44,6 +44,9 @@ static void reset_watchdog(void)
 
 static void handle_command(const char *cmd, const char *arg)
 {
+    // Any valid command resets the watchdog - it proves the host is alive
+    bool known_command = true;
+
     if (strcasecmp(cmd, "SET") == 0) {
         if (arg == NULL) {
             usb_serial_send("ERR: SET requires value 0-100\n");
@@ -54,7 +57,6 @@ static void handle_command(const char *cmd, const char *arg)
             usb_serial_send("ERR: Value must be 0-100\n");
             return;
         }
-        reset_watchdog();
         fan_pwm_set_percent((uint8_t)val);
         usb_serial_sendf("OK: %d\n", val);
     }
@@ -80,12 +82,16 @@ static void handle_command(const char *cmd, const char *arg)
             since_cmd_ms);
     }
     else if (strcasecmp(cmd, "PING") == 0) {
-        reset_watchdog();
         usb_serial_send("PONG\n");
     }
     else {
+        known_command = false;
         usb_serial_sendf("ERR: Unknown command '%s'\n", cmd);
         usb_serial_send("Commands: SET <0-100>, GET, RPM, STATUS, PING, WD\n");
+    }
+
+    if (known_command) {
+        reset_watchdog();
     }
 }
 
