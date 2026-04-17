@@ -81,14 +81,22 @@ class Config:
         default_factory=lambda: [
             (35, 0),
             (35.1, 25),
+            (45, 70),
+            (60, 90),
             (75, 100),
         ]
     )
 
-    hysteresis_c: float = 2.0
+    hysteresis_c: float = 1.0
     min_speed_change: int = 3
-    ramp_up_rate: int = 20
-    ramp_down_rate: int = 10
+    ramp_up_rate: int = 40
+    ramp_down_rate: int = 25
+
+    # Peak-hold: the fan curve is driven by `peak_temp`, which snaps up to
+    # match the current reading instantly but decays down at this rate.
+    # Effect: aggressive response on the way up, gradual release on the way
+    # down, so a hot GPU keeps cooling airflow until it's actually cool.
+    peak_decay_rate: float = 1.0        # °C per second
 
 
 # ---------- GPU sensor ----------
@@ -176,6 +184,8 @@ class FanController:
         self.last_temp: float | None = None
         self.current_speed = 100
         self.target_speed = 100
+        self.peak_temp: float | None = None
+        self._last_peak_update: float | None = None
 
     # ----- Connection management -----
 
@@ -311,6 +321,19 @@ class FanController:
 
     # ----- Control loop -----
 
+    def _update_peak(self, current_temp: float) -> float:
+        now = time.monotonic()
+        if self.peak_temp is None or self._last_peak_update is None:
+            self.peak_temp = current_temp
+        elif current_temp >= self.peak_temp:
+            self.peak_temp = current_temp
+        else:
+            dt = now - self._last_peak_update
+            decay = self.config.peak_decay_rate * dt
+            self.peak_temp = max(current_temp, self.peak_temp - decay)
+        self._last_peak_update = now
+        return self.peak_temp
+
     def _smooth_speed(self, current: int, target: int) -> int:
         if current == target:
             return target
@@ -344,14 +367,16 @@ class FanController:
                 if temp is None:
                     log.warning("Failed to read GPU temp — forcing 100%")
                     self.target_speed = 100
+                    effective_temp = None
                 else:
-                    new_target = calculate_fan_speed(temp, self.config.fan_curve)
+                    effective_temp = self._update_peak(temp)
+                    new_target = calculate_fan_speed(effective_temp, self.config.fan_curve)
                     if (
                         self.last_temp is None
-                        or abs(temp - self.last_temp) >= self.config.hysteresis_c
+                        or abs(effective_temp - self.last_temp) >= self.config.hysteresis_c
                     ):
                         self.target_speed = new_target
-                        self.last_temp = temp
+                        self.last_temp = effective_temp
 
                 next_speed = self._smooth_speed(self.current_speed, self.target_speed)
 
@@ -368,8 +393,15 @@ class FanController:
                                 if next_speed == self.target_speed
                                 else f"ramping to {self.target_speed}%"
                             )
-                            tstr = f"{temp:.1f}C" if temp is not None else "?"
-                            log.info(f"GPU: {tstr} -> Fan: {next_speed}% ({tag}) | RPM: {rpm}")
+                            if temp is not None and effective_temp is not None:
+                                peak_str = (
+                                    f"{temp:.1f}C"
+                                    if abs(effective_temp - temp) < 0.5
+                                    else f"{temp:.1f}C peak {effective_temp:.1f}C"
+                                )
+                            else:
+                                peak_str = "?"
+                            log.info(f"GPU: {peak_str} -> Fan: {next_speed}% ({tag}) | RPM: {rpm}")
 
                 # Keep the device watchdog fed every tick, regardless of SET activity.
                 self.send_keepalive()

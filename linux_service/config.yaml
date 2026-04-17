@@ -13,19 +13,28 @@ poll_interval: 1.0
 # several consecutive frames were lost.
 host_watchdog_s: 2.0
 
-# Fan curve: [temperature_celsius, fan_speed_percent]
-# Linear interpolation between points. Step function at 35C, ramp to 100% at 75C.
+# Fan curve: [temperature_celsius, fan_speed_percent].
+# Aggressive in the "still warm" mid-zone — pull heat out fast, then drop
+# sharply to minimum once actually cool.
 fan_curve:
-  - [35, 0]      # 35C and below -> 0% (fan off)
-  - [35.1, 25]   # Just above 35C -> step to 25%
-  - [75, 100]    # 75C -> 100% (full blast)
+  - [35, 0]      # Off below 35
+  - [35.1, 25]   # Minimum quiet speed just above threshold
+  - [45, 70]     # Aggressive airflow while still warm
+  - [60, 90]
+  - [75, 100]    # Full blast by 75
 
 # Don't re-compute target unless temp changed by this much.
-hysteresis_c: 2.0
+hysteresis_c: 1.0
 
 # Minimum speed delta to emit a SET command.
 min_speed_change: 3
 
 # Smoothing: max % change per poll interval.
-ramp_up_rate: 20
-ramp_down_rate: 10
+ramp_up_rate: 40
+ramp_down_rate: 25
+
+# Peak-hold: the curve is actually driven by `peak_temp`, which snaps up
+# instantly to match the current reading but decays down at this rate (°C/s).
+# A hot GPU keeps aggressive airflow on the way down until it's genuinely
+# cool, rather than giving up cooling authority as soon as temp dips.
+peak_decay_rate: 1.0
