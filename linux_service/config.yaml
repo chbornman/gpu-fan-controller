@@ -5,28 +5,27 @@
 serial_port: "/dev/gpu-fan-ctrl"
 serial_baud: 115200
 
-# How often to check temperature and send commands (seconds)
-# Must be less than ESP32 watchdog timeout (5 seconds)
-poll_interval: 2.0
+# Control + keepalive tick (seconds). Must be well under host_watchdog_s.
+poll_interval: 1.0
+
+# Declare the ESP32 link dead if no STATUS frame arrives within this many
+# seconds. The ESP pushes STATUS every 500 ms, so anything > ~1.5s means
+# several consecutive frames were lost.
+host_watchdog_s: 2.0
 
 # Fan curve: [temperature_celsius, fan_speed_percent]
-# Linear interpolation between points
-# Step function at 35C, then ramp to 100% at 75C
+# Linear interpolation between points. Step function at 35C, ramp to 100% at 75C.
 fan_curve:
   - [35, 0]      # 35C and below -> 0% (fan off)
   - [35.1, 25]   # Just above 35C -> step to 25%
   - [75, 100]    # 75C -> 100% (full blast)
 
-# Don't change fan speed unless temp changed by this much
-# Prevents fan speed oscillation
+# Don't re-compute target unless temp changed by this much.
 hysteresis_c: 2.0
 
-# Minimum speed change to actually send command
-# Reduces serial communication
+# Minimum speed delta to emit a SET command.
 min_speed_change: 3
 
-# Smoothing: max speed change per poll interval
-# Ramps up faster (cooling priority), down slower (reduce noise/oscillation)
-# Set to 100 to disable smoothing (instant changes)
-ramp_up_rate: 20    # Max % increase per poll (0-100% in ~10s at 2s poll)
-ramp_down_rate: 10  # Max % decrease per poll (100-0% in ~20s at 2s poll)
+# Smoothing: max % change per poll interval.
+ramp_up_rate: 20
+ramp_down_rate: 10

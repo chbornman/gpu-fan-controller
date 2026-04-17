@@ -1,87 +1,88 @@
 #include "usb_serial.h"
-#include "esp_log.h"
+#include "proto.h"
+#include "driver/uart.h"
 #include <string.h>
-#include <stdarg.h>
-#include <stdio.h>
 
-static const char *TAG = "usb_serial";
+// The dev board routes UART0 through an on-board CH340 USB-UART bridge, so
+// "USB" at the host side is really UART0 at the ESP32. We own UART0 here and
+// the ESP-IDF console is disabled globally (see sdkconfig.defaults), so
+// nothing else writes to this pin pair.
 
-#define LINE_BUF_SIZE 128
+#define UART_PORT      UART_NUM_0
+#define UART_BAUD      115200
+#define RX_BUF_BYTES   512
+#define TX_BUF_BYTES   512
 
-static char line_buf[LINE_BUF_SIZE];
-static size_t line_pos = 0;
-static usb_serial_cmd_callback_t cmd_callback = NULL;
+static uint8_t rx_accum[PROTO_MAX_FRAME];
+static size_t  rx_accum_len = 0;
+static bool    rx_overflow  = false;
+
+static usb_serial_frame_callback_t frame_cb = NULL;
 
 esp_err_t usb_serial_init(void)
 {
-    ESP_LOGI(TAG, "USB Serial initialized");
-    return ESP_OK;
+    const uart_config_t cfg = {
+        .baud_rate  = UART_BAUD,
+        .data_bits  = UART_DATA_8_BITS,
+        .parity     = UART_PARITY_DISABLE,
+        .stop_bits  = UART_STOP_BITS_1,
+        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    esp_err_t err = uart_driver_install(UART_PORT, RX_BUF_BYTES, TX_BUF_BYTES,
+                                        0, NULL, 0);
+    if (err != ESP_OK) return err;
+    return uart_param_config(UART_PORT, &cfg);
 }
 
-void usb_serial_set_callback(usb_serial_cmd_callback_t callback)
+void usb_serial_set_frame_callback(usb_serial_frame_callback_t cb)
 {
-    cmd_callback = callback;
+    frame_cb = cb;
 }
 
-void usb_serial_send(const char *response)
+esp_err_t usb_serial_send_frame(uint8_t type,
+                                const uint8_t *payload, size_t payload_len)
 {
-    printf("%s", response);
-    fflush(stdout);
+    uint8_t frame[PROTO_MAX_FRAME];
+    size_t n = proto_encode_frame(type, payload, payload_len, frame, sizeof(frame));
+    if (n == 0) return ESP_ERR_INVALID_SIZE;
+
+    int written = uart_write_bytes(UART_PORT, frame, n);
+    return (written == (int)n) ? ESP_OK : ESP_ERR_TIMEOUT;
 }
 
-void usb_serial_sendf(const char *fmt, ...)
+static void dispatch_accum(void)
 {
-    va_list args;
-    va_start(args, fmt);
-    vprintf(fmt, args);
-    va_end(args);
-    fflush(stdout);
-}
-
-static void parse_and_dispatch(char *line)
-{
-    // Trim trailing whitespace
-    size_t len = strlen(line);
-    while (len > 0 && (line[len-1] == '\r' || line[len-1] == '\n' || line[len-1] == ' ')) {
-        line[--len] = '\0';
-    }
-
-    if (len == 0) {
+    if (rx_overflow) {
+        rx_overflow = false;
+        rx_accum_len = 0;
         return;
     }
+    if (rx_accum_len == 0) return;
 
-    // Split into command and argument
-    char *cmd = line;
-    char *arg = NULL;
-
-    char *space = strchr(line, ' ');
-    if (space) {
-        *space = '\0';
-        arg = space + 1;
-        while (*arg == ' ') arg++;
+    uint8_t type;
+    uint8_t payload[PROTO_MAX_PAYLOAD];
+    size_t payload_len = sizeof(payload);
+    if (proto_decode_frame(rx_accum, rx_accum_len, &type, payload, &payload_len)) {
+        if (frame_cb) frame_cb(type, payload, payload_len);
     }
-
-    ESP_LOGI(TAG, "Command: '%s', Arg: '%s'", cmd, arg ? arg : "(none)");
-
-    if (cmd_callback) {
-        cmd_callback(cmd, arg);
-    }
+    rx_accum_len = 0;
 }
 
 void usb_serial_process(void)
 {
-    int c = getchar();
-
-    while (c != EOF) {
-        if (c == '\n' || c == '\r') {
-            if (line_pos > 0) {
-                line_buf[line_pos] = '\0';
-                parse_and_dispatch(line_buf);
-                line_pos = 0;
+    uint8_t buf[64];
+    int n;
+    while ((n = uart_read_bytes(UART_PORT, buf, sizeof(buf), 0)) > 0) {
+        for (int i = 0; i < n; i++) {
+            uint8_t b = buf[i];
+            if (b == 0x00) {
+                dispatch_accum();
+            } else if (rx_accum_len < sizeof(rx_accum)) {
+                rx_accum[rx_accum_len++] = b;
+            } else {
+                rx_overflow = true;
             }
-        } else if (line_pos < LINE_BUF_SIZE - 1) {
-            line_buf[line_pos++] = (char)c;
         }
-        c = getchar();
     }
 }

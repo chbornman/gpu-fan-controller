@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """
-GPU Fan Controller - Linux Service
+GPU Fan Controller — Linux Service
 
-Monitors GPU temperature and sends fan speed commands to ESP32 controller.
-Designed for AMD Radeon Pro V620 but should work with any AMD GPU.
+Drives an ESP32-S3 fan controller over a COBS-framed binary protocol on
+USB Serial/JTAG.
 
-Usage:
-    python gpu_fan_ctrl.py [--config /path/to/config.yaml]
+Design:
+  - ESP32 pushes MSG_STATUS frames unsolicited every 500 ms.
+  - Host sends MSG_CMD_SET only when the target fan speed changes, plus a
+    MSG_CMD_KEEPALIVE every poll tick so the device watchdog stays happy.
+  - Host watchdog: if no STATUS arrives within host_watchdog_s, the link is
+    declared dead and the connection is torn down and retried.
+  - Device watchdog: if no frame arrives within 5 s, the device ramps to 100%.
 
-The service will:
-1. Find the GPU temperature sensor in /sys/class/drm/
-2. Connect to the ESP32 over USB serial
-3. Apply a fan curve based on temperature
-4. Send speed commands every POLL_INTERVAL seconds
+Logs from the ESP firmware are routed to UART0 so they can never be confused
+for protocol bytes.
 """
 
 import argparse
@@ -20,15 +22,17 @@ import glob
 import logging
 import os
 import signal
+import struct
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import serial
 import yaml
+from cobs import cobs
 
-# Logging setup
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -37,45 +41,59 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+# ---------- Protocol (must match firmware/proto.h) ----------
+
+MSG_CMD_SET       = 0x01
+MSG_CMD_KEEPALIVE = 0x02
+MSG_STATUS        = 0x10
+
+# STATUS payload: u8 speed, u16 rpm, u8 wd_triggered, u32 uptime_ms
+STATUS_STRUCT = struct.Struct("<BHBI")
+
+MAX_FRAME_BYTES = 256
+
+
+def encode_frame(msg_type: int, payload: bytes = b"") -> bytes:
+    body = bytes([msg_type]) + payload
+    return cobs.encode(body) + b"\x00"
+
+
+def decode_frame(frame: bytes) -> tuple[int, bytes] | None:
+    try:
+        body = cobs.decode(frame)
+    except cobs.DecodeError:
+        return None
+    if not body:
+        return None
+    return body[0], body[1:]
+
+
+# ---------- Config ----------
+
 @dataclass
 class Config:
-    """Service configuration"""
+    serial_port: str = "/dev/gpu-fan-ctrl"
+    serial_baud: int = 115200           # Ignored by USB-CDC, required by pyserial.
+    poll_interval: float = 1.0          # Control/keepalive tick.
+    host_watchdog_s: float = 2.0        # Declare disconnected if no STATUS in this time.
 
-    serial_port: str = "/dev/ttyACM0"
-    serial_baud: int = 115200
-    poll_interval: float = 2.0  # seconds - must be < watchdog timeout (5s)
-
-    # Fan curve: list of (temp_c, speed_percent) tuples
-    # Linear interpolation between points
-    # Default fan curve for V620 / LLM workloads
-    # Step function at 35C, then ramp to 100% at 75C
     fan_curve: list = field(
         default_factory=lambda: [
-            (35, 0),  # 35C and below -> 0% (fan off)
-            (35.1, 25),  # Just above 35C -> step to 25%
-            (75, 100),  # 75C -> 100% (full blast)
+            (35, 0),
+            (35.1, 25),
+            (75, 100),
         ]
     )
 
-    # Hysteresis: don't change speed unless temp changed by this much
     hysteresis_c: float = 2.0
-
-    # Minimum speed change to actually send (reduces serial chatter)
     min_speed_change: int = 3
+    ramp_up_rate: int = 20
+    ramp_down_rate: int = 10
 
-    # Smoothing: max speed change per poll interval (0 = disabled)
-    # Ramp up faster (cooling needed), ramp down slower (avoid oscillation)
-    ramp_up_rate: int = 20  # Max % increase per poll
-    ramp_down_rate: int = 10  # Max % decrease per poll
 
+# ---------- GPU sensor ----------
 
 def find_gpu_temp_sensor() -> str | None:
-    """
-    Find AMD GPU temperature sensor in sysfs.
-    Prefers junction temp (hottest spot) over edge temp.
-    Returns path to temp*_input file or None if not found.
-    """
-    # First pass: find all AMD GPU hwmon directories and their sensors
     all_sensors = []
     for drm_path in glob.glob("/sys/class/drm/card*/device/hwmon/hwmon*"):
         hwmon_dir = Path(drm_path)
@@ -85,7 +103,6 @@ def find_gpu_temp_sensor() -> str | None:
         name = name_file.read_text().strip()
         if "amdgpu" not in name.lower():
             continue
-
         for temp_input in hwmon_dir.glob("temp*_input"):
             label_file = temp_input.with_name(
                 temp_input.name.replace("_input", "_label")
@@ -99,12 +116,6 @@ def find_gpu_temp_sensor() -> str | None:
         log.warning("No AMD GPU temperature sensor found in sysfs")
         return None
 
-    # Log all found sensors
-    log.debug(f"Found {len(all_sensors)} AMD GPU temp sensors")
-    for path, label in all_sensors:
-        log.debug(f"  {path} ({label or 'no label'})")
-
-    # Prefer junction > edge > anything else
     for preferred in ["junction", "edge", ""]:
         for path, label in all_sensors:
             if label == preferred or (
@@ -113,385 +124,285 @@ def find_gpu_temp_sensor() -> str | None:
                 log.info(f"Using AMD GPU sensor: {path} (label: {label or 'unknown'})")
                 return path
 
-    # Fallback to first sensor
     path, label = all_sensors[0]
     log.info(f"Using AMD GPU sensor: {path} (label: {label or 'unknown'})")
     return path
 
 
 def read_gpu_temp(sensor_path: str) -> float | None:
-    """Read GPU temperature in Celsius from sysfs."""
     try:
         with open(sensor_path, "r") as f:
-            # sysfs reports millidegrees
-            millidegrees = int(f.read().strip())
-            return millidegrees / 1000.0
+            return int(f.read().strip()) / 1000.0
     except (IOError, ValueError) as e:
         log.error(f"Failed to read GPU temp: {e}")
         return None
 
 
 def calculate_fan_speed(temp_c: float, fan_curve: list) -> int:
-    """
-    Calculate target fan speed based on temperature using linear interpolation.
-    """
     if temp_c <= fan_curve[0][0]:
-        log.debug(f"Temp {temp_c:.1f}C <= min {fan_curve[0][0]}C -> {fan_curve[0][1]}%")
         return fan_curve[0][1]
-
     if temp_c >= fan_curve[-1][0]:
-        log.debug(
-            f"Temp {temp_c:.1f}C >= max {fan_curve[-1][0]}C -> {fan_curve[-1][1]}%"
-        )
         return fan_curve[-1][1]
 
-    # Find the two points to interpolate between
     for i in range(len(fan_curve) - 1):
         t1, s1 = fan_curve[i]
         t2, s2 = fan_curve[i + 1]
-
         if t1 <= temp_c <= t2:
-            # Linear interpolation
             ratio = (temp_c - t1) / (t2 - t1)
-            speed = s1 + ratio * (s2 - s1)
-            result = int(round(speed))
-            log.debug(
-                f"Temp {temp_c:.1f}C in [{t1}C,{t2}C] -> lerp({s1}%,{s2}%) = {result}%"
-            )
-            return result
+            return int(round(s1 + ratio * (s2 - s1)))
+    return fan_curve[-1][1]
 
-    return fan_curve[-1][1]  # Fallback to max
 
+# ---------- Fan controller ----------
 
 class FanController:
-    """Manages serial communication with ESP32 fan controller."""
-
-    # Reconnection settings
-    RECONNECT_DELAY_INITIAL = 1.0  # seconds
-    RECONNECT_DELAY_MAX = 30.0  # seconds
-    RECONNECT_DELAY_MULTIPLIER = 2.0
+    RECONNECT_INITIAL_S    = 1.0
+    RECONNECT_MAX_S        = 10.0
+    RECONNECT_MULTIPLIER   = 2.0
+    INITIAL_STATUS_TIMEOUT = 2.0
 
     def __init__(self, config: Config):
         self.config = config
         self.serial: serial.Serial | None = None
-        self.last_temp = None
-        self.last_speed = None
         self.running = True
-        self._connected = False
-        self._reconnect_delay = self.RECONNECT_DELAY_INITIAL
+
+        self._reader_thread: threading.Thread | None = None
+        self._state_lock = threading.Lock()
+        self._last_status: dict | None = None
+        self._last_status_time: float = 0.0
+
+        self._reconnect_delay = self.RECONNECT_INITIAL_S
+
+        self.last_temp: float | None = None
+        self.current_speed = 100
+        self.target_speed = 100
+
+    # ----- Connection management -----
 
     def connect(self) -> bool:
-        """Connect to ESP32 over serial."""
         try:
             self.serial = serial.Serial(
                 port=self.config.serial_port,
                 baudrate=self.config.serial_baud,
-                timeout=1.0,
+                timeout=0.5,
+                write_timeout=0.5,
             )
-            # Wait for ESP32 to be ready
-            time.sleep(0.5)
-
-            # Flush any startup messages
             self.serial.reset_input_buffer()
-
-            # Test connection with direct write/read (not ping, to avoid recursion)
-            self.serial.write(b"PING\n")
-            self.serial.flush()
-            time.sleep(0.1)
-            response = self.serial.read(self.serial.in_waiting or 1).decode(
-                errors="ignore"
-            )
-
-            if "PONG" in response:
-                log.info(f"Connected to ESP32 on {self.config.serial_port}")
-                self._connected = True
-                self._reconnect_delay = self.RECONNECT_DELAY_INITIAL
-                return True
-            else:
-                log.error("ESP32 not responding to PING")
-                self._connected = False
-                return False
-
+            self.serial.reset_output_buffer()
         except (serial.SerialException, OSError) as e:
-            log.error(f"Failed to connect to {self.config.serial_port}: {e}")
-            self._connected = False
-            return False
-
-    def disconnect(self):
-        """Close serial connection."""
-        self._connected = False
-        if self.serial:
-            try:
-                if self.serial.is_open:
-                    self.serial.close()
-            except (serial.SerialException, OSError):
-                pass  # Already broken, ignore
+            log.warning(f"Open {self.config.serial_port} failed: {e}")
             self.serial = None
-            log.info("Disconnected from ESP32")
+            return False
 
-    def reconnect(self) -> bool:
-        """
-        Attempt to reconnect with exponential backoff.
-        Returns True if reconnection succeeded.
-        """
-        self.disconnect()
+        with self._state_lock:
+            self._last_status = None
+            self._last_status_time = 0.0
 
-        log.warning(f"Attempting reconnect in {self._reconnect_delay:.1f}s...")
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop,
+            args=(self.serial,),
+            daemon=True,
+            name="serial-reader",
+        )
+        self._reader_thread.start()
+
+        deadline = time.monotonic() + self.INITIAL_STATUS_TIMEOUT
+        while time.monotonic() < deadline:
+            with self._state_lock:
+                st = self._last_status
+            if st is not None:
+                log.info(
+                    f"Connected to ESP32 on {self.config.serial_port} "
+                    f"(speed={st['speed']}%, rpm={st['rpm']}, wd={'TRIP' if st['wd'] else 'ok'})"
+                )
+                self._reconnect_delay = self.RECONNECT_INITIAL_S
+                return True
+            time.sleep(0.05)
+
+        log.warning("Opened port but no STATUS received — tearing down")
+        self._teardown_connection()
+        return False
+
+    def _teardown_connection(self):
+        s = self.serial
+        self.serial = None
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
+        t = self._reader_thread
+        self._reader_thread = None
+        if t is not None and t is not threading.current_thread() and t.is_alive():
+            t.join(timeout=1.0)
+
+    def _reconnect(self):
+        log.info(f"Reconnecting in {self._reconnect_delay:.1f}s...")
+        self._teardown_connection()
         time.sleep(self._reconnect_delay)
-
-        if self.connect():
-            log.info("Reconnected successfully")
-            return True
-        else:
-            # Increase delay for next attempt (exponential backoff)
+        if not self.connect():
             self._reconnect_delay = min(
-                self._reconnect_delay * self.RECONNECT_DELAY_MULTIPLIER,
-                self.RECONNECT_DELAY_MAX,
+                self._reconnect_delay * self.RECONNECT_MULTIPLIER,
+                self.RECONNECT_MAX_S,
             )
-            log.error(f"Reconnect failed, next attempt in {self._reconnect_delay:.1f}s")
-            return False
 
-    def send_command(self, cmd: str) -> str | None:
-        """
-        Send command and return response.
-        Returns None and marks disconnected on I/O errors.
-        """
-        if not self._connected or not self.serial or not self.serial.is_open:
-            return None
+    # ----- Reader thread -----
 
-        try:
-            self.serial.write(f"{cmd}\n".encode())
-            self.serial.flush()
-
-            # Read response (may be multiple lines)
-            response_lines = []
-            deadline = time.time() + 1.0
-            while time.time() < deadline:
-                if self.serial.in_waiting:
-                    line = self.serial.readline().decode().strip()
-                    if line:
-                        response_lines.append(line)
-                        # Check if we got a complete response
-                        if (
-                            line.startswith("OK:")
-                            or line.startswith("ERR:")
-                            or line.startswith("PONG")
-                        ):
-                            break
+    def _reader_loop(self, s: serial.Serial):
+        accum = bytearray()
+        while self.running:
+            try:
+                data = s.read(64)
+            except (serial.SerialException, OSError, TypeError) as e:
+                # TypeError happens when the main thread closes the port mid-read:
+                # pyserial nulls its internal fd and the blocked os.read trips.
+                log.debug(f"Reader exiting: {type(e).__name__}: {e}")
+                self.serial = None
+                return
+            if not data:
+                continue
+            for b in data:
+                if b == 0:
+                    if accum:
+                        self._handle_frame(bytes(accum))
+                    accum.clear()
                 else:
-                    time.sleep(0.01)
+                    accum.append(b)
+                    if len(accum) > MAX_FRAME_BYTES:
+                        # Garbage or drift — drop and wait for next delimiter.
+                        accum.clear()
 
-            response = "\n".join(response_lines)
-            return response
+    def _handle_frame(self, frame: bytes):
+        result = decode_frame(frame)
+        if result is None:
+            return
+        msg_type, payload = result
+        if msg_type == MSG_STATUS and len(payload) == STATUS_STRUCT.size:
+            speed, rpm, wd, uptime_ms = STATUS_STRUCT.unpack(payload)
+            with self._state_lock:
+                self._last_status = {
+                    "speed": speed,
+                    "rpm": rpm,
+                    "wd": bool(wd),
+                    "uptime_ms": uptime_ms,
+                }
+                self._last_status_time = time.monotonic()
 
-        except (serial.SerialException, OSError) as e:
-            log.error(f"Serial error: {e}")
-            self._connected = False
-            return None
+    # ----- Sending -----
 
-    def ping(self) -> bool:
-        """Check if ESP32 is responding."""
-        if not self._connected:
+    def _send(self, msg_type: int, payload: bytes = b"") -> bool:
+        s = self.serial
+        if s is None:
             return False
-        response = self.send_command("PING")
-        ok = response is not None and "PONG" in response
-        if ok:
-            log.debug("PING OK")
-        return ok
-
-    def set_speed(self, percent: int) -> bool:
-        """Set fan speed percentage."""
-        percent = max(0, min(100, percent))
-        response = self.send_command(f"SET {percent}")
-        if response and "OK:" in response:
-            log.debug(f"Set fan speed to {percent}%")
+        try:
+            s.write(encode_frame(msg_type, payload))
             return True
-        else:
-            log.error(f"Failed to set speed: {response}")
+        except (serial.SerialException, OSError) as e:
+            log.warning(f"Serial write error: {e}")
+            self.serial = None
             return False
 
-    def get_status(self) -> dict | None:
-        """Get current status from ESP32."""
-        response = self.send_command("STATUS")
-        if not response:
-            return None
+    def send_set(self, percent: int) -> bool:
+        percent = max(0, min(100, percent))
+        return self._send(MSG_CMD_SET, bytes([percent]))
 
-        status = {}
-        for line in response.split("\n"):
-            if ":" in line:
-                key, value = line.split(":", 1)
-                status[key.strip()] = value.strip()
-        return status
+    def send_keepalive(self) -> bool:
+        return self._send(MSG_CMD_KEEPALIVE)
 
-    def get_rpm(self) -> tuple[int | None, int | None]:
-        """Get current fan RPM and pulse count from ESP32."""
-        response = self.send_command("RPM")
-        rpm = None
-        pulses = None
+    # ----- Control loop -----
 
-        if response:
-            for line in response.split("\n"):
-                if "RPM:" in line:
-                    try:
-                        rpm = int(line.split(":")[-1].strip())
-                    except ValueError:
-                        pass
-                elif "PULSES:" in line:
-                    try:
-                        pulses = int(line.split(":")[-1].strip())
-                    except ValueError:
-                        pass
-
-        # Sanity check - PC fans max out around 10k RPM
-        if rpm is not None and rpm > 50000:
-            log.warning(
-                f"RPM reading {rpm} is bogus (pulses: {pulses}) - shared ground connected?"
-            )
-            return None, pulses
-
-        return rpm, pulses
-
-    def smooth_speed(self, current: int, target: int) -> int:
-        """
-        Calculate next speed step toward target with smoothing.
-        Ramps up faster than down to prioritize cooling.
-        Returns the next speed to set.
-        """
+    def _smooth_speed(self, current: int, target: int) -> int:
         if current == target:
             return target
-
         if target > current:
-            # Ramping up - use faster rate
-            step = min(self.config.ramp_up_rate, target - current)
-            return current + step
-        else:
-            # Ramping down - use slower rate
-            step = min(self.config.ramp_down_rate, current - target)
-            return current - step
+            return current + min(self.config.ramp_up_rate, target - current)
+        return current - min(self.config.ramp_down_rate, current - target)
 
     def run(self, sensor_path: str):
-        """Main control loop."""
-        log.info("Starting fan control loop")
-        log.info(f"Poll interval: {self.config.poll_interval}s")
-        log.info(f"Fan curve: {self.config.fan_curve}")
+        log.info("Starting control loop")
         log.info(
-            f"Smoothing: ramp_up={self.config.ramp_up_rate}%/poll, ramp_down={self.config.ramp_down_rate}%/poll"
+            f"Poll: {self.config.poll_interval}s, "
+            f"host watchdog: {self.config.host_watchdog_s}s"
         )
-
-        target_speed = None  # What the fan curve says we should be at
-        current_speed = self.last_speed  # What we've actually set (None = unknown)
-
-        # Initial read and write on startup
-        temp = read_gpu_temp(sensor_path)
-        if temp is not None:
-            target_speed = calculate_fan_speed(temp, self.config.fan_curve)
-            current_speed = target_speed
-            self.set_speed(current_speed)
-            self.last_temp = temp
-            self.last_speed = current_speed
-            log.info(f"Initial: GPU {temp:.1f}C -> Fan {current_speed}%")
-        else:
-            log.warning("Failed to read initial GPU temp, starting at 100%")
-            current_speed = 100
-            target_speed = 100
-            self.set_speed(100)
+        log.info(f"Fan curve: {self.config.fan_curve}")
 
         while self.running:
             try:
-                # Check if we need to reconnect
-                if not self._connected:
-                    if not self.reconnect():
-                        # Reconnect failed, wait and retry next loop
-                        continue
-                    # After reconnect, re-send current speed to sync ESP32 state
-                    if current_speed is not None:
-                        log.info(f"Re-sending speed {current_speed}% after reconnect")
-                        self.set_speed(current_speed)
-
-                # Read GPU temperature
-                temp = read_gpu_temp(sensor_path)
-                if temp is None:
-                    log.warning("Failed to read GPU temp, using max speed")
-                    self.set_speed(100)
-                    current_speed = 100
-                    target_speed = 100
-                    time.sleep(self.config.poll_interval)
+                if self.serial is None:
+                    self._reconnect()
                     continue
 
-                # Calculate target speed from fan curve
-                new_target = calculate_fan_speed(temp, self.config.fan_curve)
+                with self._state_lock:
+                    last_time = self._last_status_time
+                age = time.monotonic() - last_time
+                if age > self.config.host_watchdog_s:
+                    log.warning(f"Host watchdog: no STATUS in {age:.1f}s — reconnecting")
+                    self._teardown_connection()
+                    continue
 
-                # Update target if temp changed enough (hysteresis)
-                if (
-                    self.last_temp is None
-                    or abs(temp - self.last_temp) >= self.config.hysteresis_c
-                ):
-                    target_speed = new_target
-                    self.last_temp = temp
-
-                # If no target yet, initialize it
-                if target_speed is None:
-                    target_speed = new_target
-
-                # Calculate next step toward target (smoothing)
-                next_speed = self.smooth_speed(current_speed, target_speed)
-
-                # Check if we need to send a command
-                if next_speed != current_speed:
-                    if self.set_speed(next_speed):
-                        rpm, pulses = self.get_rpm()
-                        if next_speed == target_speed:
-                            log.info(
-                                f"GPU: {temp:.1f}C -> Fan: {next_speed}% (target reached) | RPM: {rpm}"
-                            )
-                        else:
-                            log.info(
-                                f"GPU: {temp:.1f}C -> Fan: {next_speed}% (ramping to {target_speed}%) | RPM: {rpm}"
-                            )
-                        current_speed = next_speed
-                        self.last_speed = current_speed
-                    # If set_speed failed, _connected is now False,
-                    # reconnect will happen at start of next loop
+                temp = read_gpu_temp(sensor_path)
+                if temp is None:
+                    log.warning("Failed to read GPU temp — forcing 100%")
+                    self.target_speed = 100
                 else:
-                    # At target, ping to reset ESP32 watchdog
-                    if not self.ping():
-                        log.warning("Ping failed, marking disconnected for reconnect")
-                        self._connected = False
-                        continue
-                    rpm, pulses = self.get_rpm()
-                    log.debug(f"Temp: {temp:.1f}C | Fan: {current_speed}% | RPM: {rpm}")
+                    new_target = calculate_fan_speed(temp, self.config.fan_curve)
+                    if (
+                        self.last_temp is None
+                        or abs(temp - self.last_temp) >= self.config.hysteresis_c
+                    ):
+                        self.target_speed = new_target
+                        self.last_temp = temp
+
+                next_speed = self._smooth_speed(self.current_speed, self.target_speed)
+
+                if next_speed != self.current_speed:
+                    change = abs(next_speed - self.current_speed)
+                    if change >= self.config.min_speed_change or next_speed == self.target_speed:
+                        if self.send_set(next_speed):
+                            self.current_speed = next_speed
+                            with self._state_lock:
+                                st = self._last_status
+                            rpm = st["rpm"] if st else "?"
+                            tag = (
+                                "target reached"
+                                if next_speed == self.target_speed
+                                else f"ramping to {self.target_speed}%"
+                            )
+                            tstr = f"{temp:.1f}C" if temp is not None else "?"
+                            log.info(f"GPU: {tstr} -> Fan: {next_speed}% ({tag}) | RPM: {rpm}")
+
+                # Keep the device watchdog fed every tick, regardless of SET activity.
+                self.send_keepalive()
 
                 time.sleep(self.config.poll_interval)
 
             except KeyboardInterrupt:
                 break
-            except Exception as e:
-                log.exception(f"Unexpected error: {e}")
+            except Exception:
+                log.exception("Unexpected error in control loop")
                 time.sleep(self.config.poll_interval)
 
-        log.info("Fan control loop stopped")
+        log.info("Control loop stopped")
+        self._teardown_connection()
 
     def stop(self):
-        """Signal the control loop to stop."""
         self.running = False
 
 
-def load_config(config_path: str | None) -> Config:
-    """Load configuration from YAML file or use defaults."""
-    config = Config()
+# ---------- CLI ----------
 
+def load_config(config_path: str | None) -> Config:
+    config = Config()
     if config_path and os.path.exists(config_path):
         try:
             with open(config_path, "r") as f:
-                data = yaml.safe_load(f)
-                if data:
-                    for key, value in data.items():
-                        if hasattr(config, key):
-                            setattr(config, key, value)
+                data = yaml.safe_load(f) or {}
+            for key, value in data.items():
+                if hasattr(config, key):
+                    setattr(config, key, value)
             log.info(f"Loaded config from {config_path}")
         except Exception as e:
-            log.warning(f"Failed to load config: {e}, using defaults")
-
+            log.warning(f"Failed to load config ({e}) — using defaults")
     return config
 
 
@@ -500,30 +411,22 @@ def main():
     parser.add_argument("--config", "-c", help="Path to config YAML file")
     parser.add_argument("--port", "-p", help="Serial port (overrides config)")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
-    parser.add_argument(
-        "--dry-run", action="store_true", help="Don't send commands, just log"
-    )
     args = parser.parse_args()
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    # Load config
     config = load_config(args.config)
     if args.port:
         config.serial_port = args.port
 
-    # Find GPU sensor
     sensor_path = find_gpu_temp_sensor()
     if not sensor_path:
-        log.error("No GPU temperature sensor found!")
-        log.error("Make sure amdgpu driver is loaded")
+        log.error("No GPU temperature sensor found — is amdgpu loaded?")
         sys.exit(1)
 
-    # Create controller
     controller = FanController(config)
 
-    # Handle signals for clean shutdown
     def signal_handler(signum, frame):
         log.info(f"Received signal {signum}, shutting down...")
         controller.stop()
@@ -531,16 +434,10 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Connect to ESP32
-    if not controller.connect():
-        log.error("Failed to connect to ESP32")
-        sys.exit(1)
-
     try:
-        # Run control loop
         controller.run(sensor_path)
     finally:
-        controller.disconnect()
+        controller._teardown_connection()
 
     log.info("Service stopped")
 

@@ -10,117 +10,89 @@
 #include "fan_pwm.h"
 #include "fan_tach.h"
 #include "usb_serial.h"
+#include "proto.h"
 
 static const char *TAG = "gpu_fan";
 
-// GPIO Configuration - adjust these for your wiring
-#define GPIO_FAN_PWM    4   // Blue wire - PWM control
-#define GPIO_FAN_TACH   5   // Green wire - Tachometer input
+#define GPIO_FAN_PWM    4
+#define GPIO_FAN_TACH   5
 
-// Watchdog: if no command received in this time, ramp to 100%
-#define WATCHDOG_TIMEOUT_MS 5000
+// Device watchdog: if no frame arrives within this window, fall back to 100%.
+// Host keepalive is every ~1s so 5s gives plenty of margin for transient glitches.
+#define WATCHDOG_TIMEOUT_MS     5000
 #define WATCHDOG_FAILSAFE_SPEED 100
 
-static int64_t last_command_time_us = 0;
-static bool watchdog_triggered = false;
+// Unsolicited STATUS cadence. Host declares the link dead if it doesn't see one
+// within host_watchdog_s, so this must be comfortably shorter than that.
+#define STATUS_INTERVAL_MS      500
 
-// Protocol commands:
-//   SET <0-100>    - Set fan speed percentage (resets watchdog)
-//   GET            - Get current fan speed setting
-//   RPM            - Get current RPM reading
-//   STATUS         - Get full status (speed + RPM + watchdog state)
-//   PING           - Connectivity check, responds PONG (resets watchdog)
-//   WD             - Get watchdog status
+static int64_t last_frame_time_us = 0;
+static bool    watchdog_triggered = false;
 
 static void reset_watchdog(void)
 {
-    last_command_time_us = esp_timer_get_time();
+    last_frame_time_us = esp_timer_get_time();
     if (watchdog_triggered) {
         watchdog_triggered = false;
-        ESP_LOGI(TAG, "Watchdog reset - control restored");
-        usb_serial_send("INFO: Watchdog reset, control restored\n");
-    }
-}
-
-static void handle_command(const char *cmd, const char *arg)
-{
-    // Any valid command resets the watchdog - it proves the host is alive
-    bool known_command = true;
-
-    if (strcasecmp(cmd, "SET") == 0) {
-        if (arg == NULL) {
-            usb_serial_send("ERR: SET requires value 0-100\n");
-            return;
-        }
-        int val = atoi(arg);
-        if (val < 0 || val > 100) {
-            usb_serial_send("ERR: Value must be 0-100\n");
-            return;
-        }
-        fan_pwm_set_percent((uint8_t)val);
-        usb_serial_sendf("OK: %d\n", val);
-    }
-    else if (strcasecmp(cmd, "GET") == 0) {
-        usb_serial_sendf("SPEED: %d\n", fan_pwm_get_percent());
-    }
-    else if (strcasecmp(cmd, "RPM") == 0) {
-        usb_serial_sendf("RPM: %lu\nPULSES: %lu\n", fan_tach_get_rpm(), fan_tach_get_pulse_count());
-    }
-    else if (strcasecmp(cmd, "STATUS") == 0) {
-        int64_t since_cmd_ms = (esp_timer_get_time() - last_command_time_us) / 1000;
-        usb_serial_sendf("SPEED: %d\nRPM: %lu\nWATCHDOG: %s\nLAST_CMD_MS: %lld\n",
-            fan_pwm_get_percent(),
-            fan_tach_get_rpm(),
-            watchdog_triggered ? "TRIGGERED" : "OK",
-            since_cmd_ms);
-    }
-    else if (strcasecmp(cmd, "WD") == 0) {
-        int64_t since_cmd_ms = (esp_timer_get_time() - last_command_time_us) / 1000;
-        usb_serial_sendf("WATCHDOG: %s\nTIMEOUT_MS: %d\nLAST_CMD_MS: %lld\n",
-            watchdog_triggered ? "TRIGGERED" : "OK",
-            WATCHDOG_TIMEOUT_MS,
-            since_cmd_ms);
-    }
-    else if (strcasecmp(cmd, "PING") == 0) {
-        usb_serial_send("PONG\n");
-    }
-    else {
-        known_command = false;
-        usb_serial_sendf("ERR: Unknown command '%s'\n", cmd);
-        usb_serial_send("Commands: SET <0-100>, GET, RPM, STATUS, PING, WD\n");
-    }
-
-    if (known_command) {
-        reset_watchdog();
+        ESP_LOGI(TAG, "Watchdog cleared — control restored");
     }
 }
 
 static void check_watchdog(void)
 {
-    if (watchdog_triggered) {
-        return;  // Already in failsafe mode
-    }
-
-    int64_t now_us = esp_timer_get_time();
-    int64_t elapsed_ms = (now_us - last_command_time_us) / 1000;
-
+    if (watchdog_triggered) return;
+    int64_t elapsed_ms = (esp_timer_get_time() - last_frame_time_us) / 1000;
     if (elapsed_ms > WATCHDOG_TIMEOUT_MS) {
         watchdog_triggered = true;
-        ESP_LOGW(TAG, "WATCHDOG TRIGGERED! No command for %lld ms. Ramping to %d%%",
-            elapsed_ms, WATCHDOG_FAILSAFE_SPEED);
+        ESP_LOGW(TAG, "WATCHDOG: no frame in %lld ms — ramping to %d%%",
+                 elapsed_ms, WATCHDOG_FAILSAFE_SPEED);
         fan_pwm_set_percent(WATCHDOG_FAILSAFE_SPEED);
-        usb_serial_sendf("WARN: Watchdog triggered! Fan set to %d%%\n", WATCHDOG_FAILSAFE_SPEED);
     }
+}
+
+static void on_frame(uint8_t type, const uint8_t *payload, size_t payload_len)
+{
+    switch (type) {
+    case MSG_CMD_SET:
+        if (payload_len != 1) {
+            ESP_LOGW(TAG, "CMD_SET: bad payload len %u", (unsigned)payload_len);
+            return;
+        }
+        {
+            uint8_t pct = payload[0];
+            if (pct > 100) pct = 100;
+            fan_pwm_set_percent(pct);
+        }
+        break;
+
+    case MSG_CMD_KEEPALIVE:
+        break;
+
+    default:
+        ESP_LOGW(TAG, "Unknown frame type 0x%02x", type);
+        return;
+    }
+    reset_watchdog();
+}
+
+static void send_status(void)
+{
+    status_payload_t s = {
+        .speed        = fan_pwm_get_percent(),
+        .rpm          = (uint16_t)fan_tach_get_rpm(),
+        .wd_triggered = watchdog_triggered ? 1 : 0,
+        .uptime_ms    = (uint32_t)(esp_timer_get_time() / 1000),
+    };
+    usb_serial_send_frame(MSG_STATUS, (const uint8_t *)&s, sizeof(s));
 }
 
 void app_main(void)
 {
     ESP_LOGI(TAG, "=== GPU Fan Controller ===");
     ESP_LOGI(TAG, "PWM GPIO: %d, TACH GPIO: %d", GPIO_FAN_PWM, GPIO_FAN_TACH);
-    ESP_LOGI(TAG, "Watchdog timeout: %d ms, Failsafe speed: %d%%",
-        WATCHDOG_TIMEOUT_MS, WATCHDOG_FAILSAFE_SPEED);
+    ESP_LOGI(TAG, "Device watchdog: %d ms -> %d%%, STATUS every %d ms",
+             WATCHDOG_TIMEOUT_MS, WATCHDOG_FAILSAFE_SPEED, STATUS_INTERVAL_MS);
 
-    // Initialize NVS (required for some drivers)
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -128,36 +100,25 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(err);
 
-    // Initialize subsystems
     ESP_ERROR_CHECK(usb_serial_init());
     ESP_ERROR_CHECK(fan_pwm_init(GPIO_FAN_PWM));
     ESP_ERROR_CHECK(fan_tach_init(GPIO_FAN_TACH));
 
-    // Register command handler
-    usb_serial_set_callback(handle_command);
+    usb_serial_set_frame_callback(on_frame);
+    last_frame_time_us = esp_timer_get_time();
 
-    // Initialize watchdog timer
-    last_command_time_us = esp_timer_get_time();
+    // All ESP_LOG calls are compiled out (CONFIG_LOG_DEFAULT_LEVEL_NONE) so
+    // nothing besides protocol frames can ever reach UART0.
 
-    ESP_LOGI(TAG, "Initialization complete. Waiting for commands...");
-    usb_serial_send("\n=== GPU Fan Controller Ready ===\n");
-    usb_serial_sendf("Watchdog: %d ms timeout, %d%% failsafe\n",
-        WATCHDOG_TIMEOUT_MS, WATCHDOG_FAILSAFE_SPEED);
-    usb_serial_send("Commands: SET <0-100>, GET, RPM, STATUS, PING, WD\n\n");
-
-    // Main loop
-    uint32_t loop_count = 0;
+    int64_t next_status_us = esp_timer_get_time();
     while (1) {
         usb_serial_process();
         check_watchdog();
 
-        // Log status every 10 seconds
-        if (++loop_count >= 1000) {
-            ESP_LOGI(TAG, "Fan: %d%%, RPM: %lu, WD: %s",
-                fan_pwm_get_percent(),
-                fan_tach_get_rpm(),
-                watchdog_triggered ? "TRIGGERED" : "OK");
-            loop_count = 0;
+        int64_t now = esp_timer_get_time();
+        if (now >= next_status_us) {
+            send_status();
+            next_status_us = now + STATUS_INTERVAL_MS * 1000LL;
         }
 
         vTaskDelay(pdMS_TO_TICKS(10));
