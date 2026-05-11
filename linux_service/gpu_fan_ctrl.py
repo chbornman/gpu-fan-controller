@@ -191,12 +191,18 @@ class FanController:
 
     def connect(self) -> bool:
         try:
-            self.serial = serial.Serial(
-                port=self.config.serial_port,
-                baudrate=self.config.serial_baud,
-                timeout=0.5,
-                write_timeout=0.5,
-            )
+            # Deferred-open with DTR/RTS deasserted. The CH343 USB-serial bridge on
+            # the ESP32-S3 dev board wires DTR to EN; asserting it on port open
+            # resets the chip, so STATUS frames never arrive before we tear down.
+            s = serial.Serial()
+            s.port = self.config.serial_port
+            s.baudrate = self.config.serial_baud
+            s.timeout = 0.5
+            s.write_timeout = 0.5
+            s.dtr = False
+            s.rts = False
+            s.open()
+            self.serial = s
             self.serial.reset_input_buffer()
             self.serial.reset_output_buffer()
         except (serial.SerialException, OSError) as e:

@@ -10,3 +10,8 @@ SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{serial}=="5577018485", SYMLINK+
 
 # Disable USB autosuspend for this device to prevent watchdog timeouts
 ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="1a86", ATTR{serial}=="5577018485", ATTR{power/autosuspend_delay_ms}="-1"
+
+# Keep the AMD Radeon Pro V620 (1002:73a1) awake (D0) so hwmon temps are readable.
+# Without this the card runtime-suspends to D3cold when idle/headless and every
+# /sys read (temps, gpu_metrics, pp_dpm_*) returns EBUSY.
+ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x1002", ATTR{device}=="0x73a1", ATTR{power/control}="on"
