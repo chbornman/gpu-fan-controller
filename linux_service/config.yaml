@@ -14,24 +14,24 @@ poll_interval: 1.0
 host_watchdog_s: 2.0
 
 # Fan curve: [temperature_celsius, fan_speed_percent].
-# Aggressive in the "still warm" mid-zone — pull heat out fast, then drop
-# sharply to minimum once actually cool.
+# Conservative targets — lets temps run higher, but when the target changes
+# the fan snaps to it quickly rather than crawling there.
 fan_curve:
   - [35, 0]      # Off below 35
-  - [35.1, 25]   # Minimum quiet speed just above threshold
-  - [45, 70]     # Aggressive airflow while still warm
-  - [60, 90]
-  - [75, 100]    # Full blast by 75
+  - [55, 20]     # Barely audible until genuinely warm
+  - [70, 45]     # Moderate breeze at sustained load
+  - [85, 75]     # Serious airflow approaching throttle zone
+  - [95, 100]    # Full blast near hard limit
 
 # Don't re-compute target unless temp changed by this much.
-hysteresis_c: 1.0
+hysteresis_c: 1.5
 
 # Minimum speed delta to emit a SET command.
 min_speed_change: 3
 
-# Smoothing: max % change per poll interval.
-ramp_up_rate: 40
-ramp_down_rate: 25
+# Smoothing: max % change per poll interval. Track targets quickly.
+ramp_up_rate: 60
+ramp_down_rate: 40
 
 # Peak-hold: the curve is actually driven by `peak_temp`, which snaps up
 # instantly to match the current reading but decays down at this rate (°C/s).
