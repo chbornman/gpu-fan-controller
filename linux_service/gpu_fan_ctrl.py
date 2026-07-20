@@ -101,8 +101,15 @@ class Config:
 
 # ---------- GPU sensor ----------
 
-def find_gpu_temp_sensor() -> str | None:
-    all_sensors = []
+def find_gpu_temp_sensors() -> list[str]:
+    """Return one temperature sensor path per AMD GPU.
+
+    With two V620s the controller drives its curve off the hotter card, so we
+    need a sensor from each GPU rather than a single global pick. Sensors are
+    grouped by DRM card; within each card we prefer the junction sensor (the
+    hottest on-die spot), then edge, then anything else.
+    """
+    cards: dict[str, list[tuple[str, str]]] = {}
     for drm_path in glob.glob("/sys/class/drm/card*/device/hwmon/hwmon*"):
         hwmon_dir = Path(drm_path)
         name_file = hwmon_dir / "name"
@@ -111,6 +118,8 @@ def find_gpu_temp_sensor() -> str | None:
         name = name_file.read_text().strip()
         if "amdgpu" not in name.lower():
             continue
+        # .../cardN/device/hwmon/hwmonX -> .../cardN, so each GPU is one key.
+        card_key = str(hwmon_dir.parents[2])
         for temp_input in hwmon_dir.glob("temp*_input"):
             label_file = temp_input.with_name(
                 temp_input.name.replace("_input", "_label")
@@ -118,32 +127,51 @@ def find_gpu_temp_sensor() -> str | None:
             label = ""
             if label_file.exists():
                 label = label_file.read_text().strip().lower()
-            all_sensors.append((str(temp_input), label))
+            cards.setdefault(card_key, []).append((str(temp_input), label))
 
-    if not all_sensors:
+    if not cards:
         log.warning("No AMD GPU temperature sensor found in sysfs")
+        return []
+
+    def pick(sensors: list[tuple[str, str]]) -> tuple[str, str]:
+        for preferred in ["junction", "edge", ""]:
+            for path, label in sensors:
+                if label == preferred or (
+                    preferred == "" and label not in ["junction", "edge"]
+                ):
+                    return path, label
+        return sensors[0]
+
+    chosen: list[str] = []
+    for card_key in sorted(cards):
+        path, label = pick(cards[card_key])
+        log.info(
+            f"Using AMD GPU sensor: {path} (label: {label or 'unknown'}) "
+            f"on {card_key}"
+        )
+        chosen.append(path)
+
+    log.info(f"Monitoring {len(chosen)} GPU(s); driving fans off the hottest")
+    return chosen
+
+
+def read_gpu_temp(sensor_paths: list[str]) -> float | None:
+    """Read every GPU sensor and return the hottest reading.
+
+    Sensors that fail to read are skipped so a single unreadable card doesn't
+    blind the controller. Only when *all* reads fail do we return None, which
+    the control loop treats as a fault and forces 100%.
+    """
+    temps: list[float] = []
+    for path in sensor_paths:
+        try:
+            with open(path, "r") as f:
+                temps.append(int(f.read().strip()) / 1000.0)
+        except (IOError, ValueError) as e:
+            log.error(f"Failed to read GPU temp from {path}: {e}")
+    if not temps:
         return None
-
-    for preferred in ["junction", "edge", ""]:
-        for path, label in all_sensors:
-            if label == preferred or (
-                preferred == "" and label not in ["junction", "edge"]
-            ):
-                log.info(f"Using AMD GPU sensor: {path} (label: {label or 'unknown'})")
-                return path
-
-    path, label = all_sensors[0]
-    log.info(f"Using AMD GPU sensor: {path} (label: {label or 'unknown'})")
-    return path
-
-
-def read_gpu_temp(sensor_path: str) -> float | None:
-    try:
-        with open(sensor_path, "r") as f:
-            return int(f.read().strip()) / 1000.0
-    except (IOError, ValueError) as e:
-        log.error(f"Failed to read GPU temp: {e}")
-        return None
+    return max(temps)
 
 
 def calculate_fan_speed(temp_c: float, fan_curve: list) -> int:
@@ -347,7 +375,7 @@ class FanController:
             return current + min(self.config.ramp_up_rate, target - current)
         return current - min(self.config.ramp_down_rate, current - target)
 
-    def run(self, sensor_path: str):
+    def run(self, sensor_paths: list[str]):
         log.info("Starting control loop")
         log.info(
             f"Poll: {self.config.poll_interval}s, "
@@ -369,7 +397,7 @@ class FanController:
                     self._teardown_connection()
                     continue
 
-                temp = read_gpu_temp(sensor_path)
+                temp = read_gpu_temp(sensor_paths)
                 if temp is None:
                     log.warning("Failed to read GPU temp — forcing 100%")
                     self.target_speed = 100
@@ -458,8 +486,8 @@ def main():
     if args.port:
         config.serial_port = args.port
 
-    sensor_path = find_gpu_temp_sensor()
-    if not sensor_path:
+    sensor_paths = find_gpu_temp_sensors()
+    if not sensor_paths:
         log.error("No GPU temperature sensor found — is amdgpu loaded?")
         sys.exit(1)
 
@@ -473,7 +501,7 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
 
     try:
-        controller.run(sensor_path)
+        controller.run(sensor_paths)
     finally:
         controller._teardown_connection()
 

@@ -9,7 +9,7 @@ ESP32-S3 based fan controller for GPUs that lack Linux software fan control (lik
 │ LINUX PC                                                    │
 │                                                             │
 │  ┌──────────────────┐     ┌──────────────────────────────┐ │
-│  │ gpu_fan_ctrl.py  │────►│ /sys/class/drm/.../temp1     │ │
+│  │ gpu_fan_ctrl.py  │────►│ max junction, both cards     │ │
 │  │ (systemd svc)    │     └──────────────────────────────┘ │
 │  └────────┬─────────┘                                       │
 │           │ USB Serial: "SET 75"                            │
@@ -20,49 +20,96 @@ ESP32-S3 based fan controller for GPUs that lack Linux software fan control (lik
 │ ESP32-S3                                                    │
 │                                                             │
 │  • Receives speed commands (SET 0-100)                      │
-│  • Outputs 25kHz PWM to fan                                 │
-│  • Reads tachometer for RPM                                 │
+│  • Outputs 25kHz PWM on GPIO5 (MOSFET gate)                 │
+│  • Tach unused (3-pin fans)                                 │
 │  • WATCHDOG: No command in 5s → 100% speed (failsafe)       │
 │                                                             │
 └───────────┬─────────────────────────────────────────────────┘
             │
             ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ 4-PIN PWM FAN                                               │
+│ MOSFET-DRIVEN 3-PIN FANS                                    │
 │                                                             │
-│  • 12V power from motherboard fan header (BIOS: 100%)       │
-│  • PWM signal from ESP32                                    │
-│  • Tach signal to ESP32                                     │
+│  • 12V from PSU/header, split to all four fans              │
+│  • ESP PWM (GPIO5) drives an N-channel MOSFET gate          │
+│  • MOSFET switches the fans' shared ground                  │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ## Wiring
 
-### Fan Header Connection
+Two GPUs, each with two 30mm 3-pin fans (four fans total), all driven together
+from a single ESP32 PWM output through a low-side N-channel MOSFET. 3-pin fans
+have no PWM input pin: speed is controlled by switching their shared 12V rail,
+not by feeding them a logic signal, so the MOSFET is required.
 
-Keep the fan plugged into motherboard header for 12V power, disconnect PWM and Tach:
+### MOSFET Fan Driver
+
+GPIO5's existing 25kHz PWM drives the MOSFET gate; the MOSFET switches the fans'
+shared ground. All four fans get 12V in parallel through 3-pin splitters.
 
 ```
-Motherboard Fan Header           4-Pin Fan              ESP32-S3
-      │                              │                      │
-      ├── GND (black) ───────────────┤ GND ─────────────────┤ GND
-      ├── 12V (yellow) ──────────────┤ 12V                  │
-      ├── TACH (green) ──── X        │                      │
-      ├── PWM (blue) ────── X        │                      │
-                                     │                      │
-                      Fan TACH ──────┼──────────────────────┤ GPIO4
-                      Fan PWM ───────┼──────────────────────┤ GPIO5
+                 +12V   (motherboard fan header yellow  —or—  PSU 12V rail)
+                   │
+     ┌─────────────┼──────────────────────────────────────┐
+     │             │                                       │
+     │        ┌────┴─────┐                            cathode (striped end)
+  3-pin       │  4 fans  │  all + wires → +12V             ┿  1N5819
+  splitters   │    in    │                                 │   (flyback diode)
+  fan out     │ parallel │  all − wires → node A           │
+  the rail    └────┬─────┘                            anode │
+     │             │ node A                                 │
+     └─────────────┼────────────────────────────────────── ┘
+                   │   (node A = every fan's − wire, bundled together)
+                   │
+                   │ Drain
+               ┌───┴───┐
+ GPIO5 ─[220Ω]─┤ Gate  │   N-channel LOGIC-LEVEL MOSFET
+   (PWM 25k)   └───┬───┘   (AO3400 for this current, or IRLZ44N)
+       │           │ Source
+     [10kΩ]        │
+       │           │
+      GND ─────────┴───────────────  COMMON GROUND
+                                     (ESP32 GND + PSU/header GND all tied here)
 ```
 
-**Important:** Set BIOS fan header to 100% (or DC mode) since we're controlling PWM separately.
+### Connection Table
+
+| From | To | Notes |
+|------|----|-------|
+| ESP32 **GPIO5** | 220 Ω → MOSFET **gate** | existing PWM output, no firmware change |
+| MOSFET **gate** | 10 kΩ → **GND** | pulldown; keeps fans off while the ESP boots/floats |
+| MOSFET **drain** | **node A** (all four fan − wires) | |
+| MOSFET **source** | **common GND** | |
+| All four fan **+ wires** | **+12V** rail | bundled via 3-pin splitters |
+| Flyback diode **anode** | **node A** (drain) | 1N5819 |
+| Flyback diode **cathode** (stripe) | **+12V** | clamps inductive kickback |
+| ESP32 **GND** | **common GND** | mandatory — ESP and fan power must share ground |
 
 ### ESP32-S3 Pinout
 
-| GPIO | Function | Wire Color | Notes |
-|------|----------|------------|-------|
-| 4    | TACH IN  | Green      | Internal pull-up enabled |
-| 5    | PWM OUT  | Blue       | 25kHz PWM signal |
-| GND  | Ground   | Black      | Shared with fan |
+| GPIO | Function | Notes |
+|------|----------|-------|
+| 5    | PWM OUT  | 25kHz, drives the MOSFET gate through 220 Ω |
+| GND  | Ground   | Must be common with the 12V supply ground |
+
+Tach (GPIO4) is left unconnected: with low-side switching each fan's ground
+swings toward 12V during the off-phase, which both corrupts the reading and
+would push ~12V into a 3.3V pin. `RPM` reports 0; nothing depends on it.
+
+### Wiring Notes
+
+- **Common ground is mandatory.** ESP GND, MOSFET source, and the 12V supply
+  ground must all tie together or nothing switches. Powering the fans from a
+  spare PSU 12V connector (rather than a mobo header) keeps the board from doing
+  its own control on that rail. If you use a header, set it to 100%/full in BIOS.
+- **Use a logic-level MOSFET** (fully on at a 3.3V gate): AO3400 or IRLZ44N. A
+  plain IRF540 will not work.
+- The 10 kΩ gate pulldown holds the fans off during the second or two between
+  power-on and firmware init, then they spin up. Harmless.
+- **No firmware change needed.** GPIO5's existing 25kHz PWM drives the gate
+  as-is: higher duty = more power = faster, and the lost-link watchdog (100%)
+  now means full airflow on failure. Tach is unused, so `RPM` always reports 0.
 
 ### USB Connection
 
@@ -72,15 +119,16 @@ Connect ESP32-S3 to internal motherboard USB 2.0 header using a **USB-C to USB 2
 2. Connect header end to motherboard (e.g., JUSB2)
 3. Route cable inside case
 
-### Fan Wire Splicing
+### Fan Fan-Out (Splitters)
 
-Use a **4-pin fan extension cable** - cut it to expose the PWM (blue) and Tach (green) wires:
+All four 3-pin fans run off one switched rail, so they wire in parallel:
 
-1. Cut the extension cable in the middle
-2. Strip the blue (PWM) and green (Tach) wires
-3. Connect to ESP32 GPIO pins with jumper wires or solder
-4. Keep GND (black) and 12V (yellow) connected through to the fan
-5. Connect a jumper from ESP32 GND to the fan's GND wire (shared ground required for tach)
+1. Bundle every fan **+ (12V)** wire to the +12V rail (3-pin splitters, one per GPU
+   or a single 4-way, whatever fits the routing).
+2. Bundle every fan **− (ground)** wire together into "node A" and run that to the
+   MOSFET drain.
+3. Leave every fan **tach** wire disconnected (see the pinout note above).
+4. Tie ESP32 GND, MOSFET source, and the 12V supply ground together.
 
 ## Building the Firmware
 
@@ -229,6 +277,10 @@ rocm-smi --showtemp
 
 - ESP32-S3 DevKit with USB-C (~$8)
 - USB-C to USB 2.0 header cable (~$8)
-- 4-pin PWM fan extension cable (~$5) - cut to splice wires
+- 4× 30mm 3-pin fans (2 per GPU)
+- Logic-level N-channel MOSFET (AO3400 or IRLZ44N)
+- 220 Ω gate resistor + 10 kΩ gate pulldown
+- 1N5819 (or 1N400x) flyback diode
+- 3-pin fan splitters to fan out the 12V rail
 - Jumper wires / Dupont connectors
 - (Optional) 3D printed enclosure to mount inside case
